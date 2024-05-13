@@ -14,6 +14,11 @@ from homeassistant.components.sensor.const import (
     DEVICE_CLASS_STATE_CLASSES,
 )
 
+class folded_str(str): pass
+
+def folded_string_representer(dumper, data):
+    return dumper.represent_scalar(u'tag:yaml.org,2002:str', data, style='>')
+yaml.add_representer(folded_str, folded_string_representer)
 
 DEVICE_ID = "itho_432432"
 ROOT_TOPIC = "itho_wtw"
@@ -70,6 +75,7 @@ class HAMQTTSensor:
         state_topic: str,
         value: str,
         unit_of_measurement: str | None = None,
+        enumerations: list[dict] | None = None,
     ):
         self.name = name
         self.unique_id = unique_id
@@ -79,20 +85,39 @@ class HAMQTTSensor:
         if self.unit_of_measurement:
             self.__fix_unit()
             self.__find_device_class()
+            value = f"{value} ({self.unit_of_measurement})"
+            
 
         if self.device_class:
             state_classes = DEVICE_CLASS_STATE_CLASSES[self.device_class]
             if state_classes:
-                self.state_class = list(state_classes)[0]
+                self.state_class = SensorStateClass("measurement")
 
         self.availability_topic = availability_topic
         self.payload_available = payload_available
         self.payload_not_available = payload_not_available
 
         self.state_topic = state_topic
-        self.value_template = (
-            f"{{{{ value_json[\"{value} ({self.unit_of_measurement})\"] }}}}"
-        )
+
+        if enumerations:
+            self.value_template = f'{{% set v = value_json["{value}] | int %}}\n'
+            for index, enum in enumerate(enumerations):
+                logger.debug(f"id: {enum['index']} - {enum['value']}")    
+                if index == 0:
+                    self.value_template += f'{{% if v == {enum["index"]} %}}\n'
+                else:
+                    self.value_template += f'{{% elif v == {enum["index"]} %}}\n'
+                self.value_template += f'{enum["value"]}\n'
+                
+            self.value_template += f'{{% endif %}}'
+            self.value_template = "\n".join([line for line in self.value_template.splitlines()])
+            
+            self.value_template = folded_str(self.value_template)
+            
+
+
+        else:
+            self.value_template = f'{{{{ value_json["{value} ({self.unit_of_measurement})"] }}}}'
 
     def __fix_unit(self) -> None:
         """Fixes common mistakes in units"""
@@ -114,11 +139,7 @@ class HAMQTTSensor:
 
     def __find_device_class(self) -> None:
         """Finds device class based on unit"""
-        device_classes = [
-            device_class
-            for device_class in DEVICE_CLASSES
-            if self.fixed_unit_of_measurement in DEVICE_CLASS_UNITS[device_class]
-        ]
+        device_classes = [device_class for device_class in DEVICE_CLASSES if self.fixed_unit_of_measurement in DEVICE_CLASS_UNITS[device_class]]
 
         if not len(device_classes):
             self.device_class = None
@@ -194,9 +215,6 @@ class IthoParameter:
         self.Subtabel = Subtabel
         self.Paswoordnivo = Paswoordnivo
 
-    def to_yaml(self) -> str:
-        pass
-
 
 class IthoDatalabel:
     def __init__(
@@ -214,6 +232,7 @@ class IthoDatalabel:
         Eenheid_D: str,
         SubTabel: str,
         Visible: int,
+        enumerations: list[dict] = None,
     ):
         self.Index = Index
         self.Naam = Naam
@@ -228,6 +247,7 @@ class IthoDatalabel:
         self.Eenheid_D = Eenheid_D
         self.SubTabel = SubTabel
         self.Visible = Visible
+        self.enumerations = enumerations
 
     def __str__(self):
         return f"{self.Index} | {self.Naam} | {self.Tekst_GB} | {self.Tooltip_GB} | {self.Eenheid_GB}"
@@ -245,9 +265,7 @@ class IthoParser:
         self.tables: list[str] = []
 
         if not which("mdb-schema"):
-            raise IthoParserError(
-                "`mdb-schema` executable not found. Make sure mdbtools is installed and in PATH"
-            )
+            raise IthoParserError("`mdb-schema` executable not found. Make sure mdbtools is installed and in PATH")
 
         self.temp_dir = TemporaryDirectory()
 
@@ -258,9 +276,7 @@ class IthoParser:
         try:
             copy(parameter_file, tmp_file)
         except FileNotFoundError as err:
-            raise IthoParserError(
-                f"Parameter file not found: {parameter_file}"
-            ) from err
+            raise IthoParserError(f"Parameter file not found: {parameter_file}") from err
 
         self.parameter_file = tmp_file
         self.logger.debug(f"Created temporary file: {tmp_file}")
@@ -339,9 +355,7 @@ class IthoParser:
                 proces = Popen(export_command, stdout=table, stderr=PIPE)
                 _, std_error = proces.communicate()
                 if std_error:
-                    raise IthoParserError(
-                        f"Failed to convert table: {table_name} with error: {std_error}"
-                    )
+                    raise IthoParserError(f"Failed to convert table: {table_name} with error: {std_error}")
 
             # Insert into destination database
             with open(table_file, "r") as table:
@@ -355,9 +369,7 @@ class IthoParser:
         """Find versions based on table names"""
         version_match = ".+V[0-9]{1,2}$"
         max_version = 0
-        version_tables = [
-            table for table in self.tables if re.match(version_match, table)
-        ]
+        version_tables = [table for table in self.tables if re.match(version_match, table)]
         for table in version_tables:
             version = int(table.split("_V")[-1])
             if version > max_version:
@@ -387,10 +399,7 @@ class IthoParser:
             for parameter in result:
                 new_parameter = IthoParameter(**parameter)
                 new_parameters.append(new_parameter)
-                # self.logger.debug(parameter.keys())
-                self.logger.debug(
-                    f"Found parameter id: {parameter['Index']} name: {parameter['Tekst_NL']}"
-                )
+                self.logger.debug(f"Found parameter id: {parameter['Index']} name: {parameter['Tekst_GB']}")
             self.parameters[version] = new_parameters
 
     def find_datalabels(self) -> None:
@@ -410,11 +419,32 @@ class IthoParser:
 
             new_datalabels = []
             for datalabel in result:
+
                 new_datalabel = IthoDatalabel(**datalabel)
+                if datalabel["SubTabel"]:
+                    self.logger.debug(f"Datalabel: {datalabel['Tekst_GB']} has subtabel: {datalabel['SubTabel']}")
+                    if "errors" in datalabel["SubTabel"].lower():
+                        enums = self.get_errors()
+                    else:
+                        enums = self.get_enums(datalabel["SubTabel"])
+                    
+                    new_datalabel.enumerations = enums
+
                 new_datalabels.append(new_datalabel)
 
                 self.logger.debug(f"Found datalabel {str(new_datalabel)}")
             self.datalabels[version] = new_datalabels
+
+    def get_enums(self, table: str) -> list[dict]:
+
+        result = self.connection.execute(f'SELECT "Index", "Tekst_NL", "Tekst_GB" FROM "{table}"')
+        return [{"index": row["Index"], "value": row["Tekst_GB"] or row["Tekst_NL"]} for row in result]
+
+    def get_errors(self) -> list[dict]:
+
+        result = self.connection.execute('SELECT "Index", "Tekst_GB", "Tooltip_GB" FROM "L_M_Errors"')
+
+        return [{"index": row["Index"], "value": f"{row['Tekst_GB']} - {row['Tooltip_GB']}"} for row in result]
 
     def get_versions(self) -> list[str]:
         return self.versions
@@ -425,8 +455,14 @@ class IthoParser:
 
         sensors = []
         for datalabel in self.datalabels[version]:
+            if not datalabel.Tooltip_GB:
+                if "status" in datalabel.Tekst_GB.lower():
+                    datalabel.Tooltip_GB = "Status"
+                elif "fault" in datalabel.Tekst_GB.lower():
+                    datalabel.Tooltip_GB = "Error number"
+            
             sensor = HAMQTTSensor(
-                name=datalabel.Tekst_GB,
+                name=datalabel.Tooltip_GB,
                 unique_id=f"{DEVICE_ID}_{datalabel.Tekst_GB}",
                 availability_topic=AVAILABILITY_TOPIC,
                 payload_available=PAYLOAD_AVAILABLE,
@@ -434,6 +470,7 @@ class IthoParser:
                 state_topic=ITHO_STATUS_TOPIC,
                 value=datalabel.Tooltip_GB,
                 unit_of_measurement=datalabel.Eenheid_GB,
+                enumerations=datalabel.enumerations,
             )
             sensors.append(sensor)
 
@@ -455,7 +492,7 @@ if __name__ == "__main__":
 
     print(
         yaml.dump(
-            [sensor.to_dict() for sensor in sensors],
+            {"sensor": [sensor.to_dict() for sensor in sensors]},
             allow_unicode=True,
             sort_keys=False,
             width=1000,
